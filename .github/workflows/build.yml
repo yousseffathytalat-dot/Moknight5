@@ -25,19 +25,66 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: 8.9
 
-      - name: Find Android project and build
+      - name: Locate Android project (including uploaded ZIP archives)
         shell: bash
         run: |
           set -euo pipefail
-          PROJECT_FILE="$(find . -type f -name settings.gradle.kts -not -path '*/.gradle/*' -print -quit)"
-          if [[ -z "$PROJECT_FILE" ]]; then
-            echo "ERROR: settings.gradle.kts not found. Upload the Android project files, not only the app folder."
-            exit 1
+          if ! find . -type f -name settings.gradle.kts -not -path '*/.gradle/*' -not -path '*/build/*' -print -quit | grep -q .; then
+            ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' -not -path '*/.git/*' -print -quit)"
+            if [[ -n "$ZIP_FILE" ]]; then
+              echo "Extracting uploaded project archive: $ZIP_FILE"
+              mkdir -p .project-extract
+              unzip -oq "$ZIP_FILE" -d .project-extract
+            fi
           fi
-          PROJECT_DIR="$(dirname "$PROJECT_FILE")"
-          echo "Android project found at: $PROJECT_DIR"
+          PROJECT_FILE="$(find . -type f -name settings.gradle.kts -not -path '*/.gradle/*' -not -path '*/build/*' -not -path '*/.git/*' -print -quit)"
+          if [[ -n "$PROJECT_FILE" ]]; then
+            PROJECT_DIR="$(dirname "$PROJECT_FILE")"
+            echo "Found Android project: $PROJECT_DIR"
+            echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [[ -f "./build.gradle.kts" && -f "./src/main/AndroidManifest.xml" ]] && grep -q 'com.android.application' ./build.gradle.kts; then
+            echo "Detected app module at repository root; restoring standard Gradle layout."
+            mkdir -p app
+            mv build.gradle.kts app/build.gradle.kts
+            mv src app/src
+            if [[ -f gradle.properties ]]; then mv gradle.properties app/gradle.properties; fi
+            cat > settings.gradle.kts <<'SETTINGS'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MoPlayer"
+          include(":app")
+          SETTINGS
+            cat > build.gradle.kts <<'ROOTBUILD'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          ROOTBUILD
+            cat > gradle.properties <<'PROPS'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          PROPS
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "ERROR: No Android project found. Upload the complete project ZIP to the repository root, not only the workflow file."
+          ls -la
+          exit 1
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
           cd "$PROJECT_DIR"
           gradle --no-daemon assembleDebug
 
