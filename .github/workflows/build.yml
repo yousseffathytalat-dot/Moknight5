@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build debug APK
+    name: Build and upload debug APK
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -22,76 +22,76 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
+          gradle-version: '8.9'
 
-      - name: Locate Android project (including uploaded ZIP archives)
+      - name: Find or extract Android project
         shell: bash
         run: |
           set -euo pipefail
-          if ! find . -type f -name settings.gradle.kts -not -path '*/.gradle/*' -not -path '*/build/*' -print -quit | grep -q .; then
-            ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' -not -path '*/.git/*' -print -quit)"
-            if [[ -n "$ZIP_FILE" ]]; then
-              echo "Extracting uploaded project archive: $ZIP_FILE"
-              mkdir -p .project-extract
-              unzip -oq "$ZIP_FILE" -d .project-extract
-            fi
-          fi
-          PROJECT_FILE="$(find . -type f -name settings.gradle.kts -not -path '*/.gradle/*' -not -path '*/build/*' -not -path '*/.git/*' -print -quit)"
-          if [[ -n "$PROJECT_FILE" ]]; then
-            PROJECT_DIR="$(dirname "$PROJECT_FILE")"
-            echo "Found Android project: $PROJECT_DIR"
-            echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          if [[ -f "./build.gradle.kts" && -f "./src/main/AndroidManifest.xml" ]] && grep -q 'com.android.application' ./build.gradle.kts; then
-            echo "Detected app module at repository root; restoring standard Gradle layout."
-            mkdir -p app
-            mv build.gradle.kts app/build.gradle.kts
-            mv src app/src
-            if [[ -f gradle.properties ]]; then mv gradle.properties app/gradle.properties; fi
-            cat > settings.gradle.kts <<'SETTINGS'
-          pluginManagement {
-              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          find_settings() {
+            find . -type f -name 'settings.gradle.kts' \
+              -not -path '*/.git/*' -not -path '*/.gradle/*' -not -path '*/build/*' \
+              -print -quit 2>/dev/null || true
           }
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories { google(); mavenCentral() }
-          }
-          rootProject.name = "MoPlayer"
-          include(":app")
-          SETTINGS
-            cat > build.gradle.kts <<'ROOTBUILD'
-          plugins {
-              id("com.android.application") version "8.7.3" apply false
-              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
-          }
-          ROOTBUILD
-            cat > gradle.properties <<'PROPS'
-          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
-          android.useAndroidX=true
-          kotlin.code.style=official
-          PROPS
-            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
-            exit 0
+          SETTINGS_FILE="$(find_settings)"
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            while IFS= read -r -d '' archive; do
+              echo "Trying project archive: $archive"
+              mkdir -p "$RUNNER_TEMP/moplayer-extract"
+              if unzip -oq "$archive" -d "$RUNNER_TEMP/moplayer-extract"; then
+                SETTINGS_FILE="$(cd "$RUNNER_TEMP/moplayer-extract" && find . -type f -name 'settings.gradle.kts' -not -path '*/.gradle/*' -not -path '*/build/*' -print -quit || true)"
+                if [[ -n "$SETTINGS_FILE" ]]; then
+                  PROJECT_DIR="$RUNNER_TEMP/moplayer-extract/$(dirname "$SETTINGS_FILE" | sed 's#^\./##')"
+                  break
+                fi
+              fi
+            done < <(find . -maxdepth 5 -type f -iname '*.zip' -not -path '*/.git/*' -print0)
+          else
+            PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+            PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
           fi
-          echo "ERROR: No Android project found. Upload the complete project ZIP to the repository root, not only the workflow file."
-          ls -la
-          exit 1
+          if [[ -z "${PROJECT_DIR:-}" || ! -f "$PROJECT_DIR/settings.gradle.kts" ]]; then
+            echo 'ERROR: Could not find settings.gradle.kts. Upload the extracted complete project or a ZIP containing it.'
+            echo 'Repository files:'
+            find . -maxdepth 4 -type f | sort | head -200
+            exit 1
+          fi
+          echo "Android project found at: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
       - name: Build debug APK
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-          gradle --no-daemon assembleDebug
+          gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Locate APK and prepare artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Searching under: $PROJECT_DIR"
+          find "$PROJECT_DIR" -type f -iname '*.apk' -print
+          APK_PATH="$(find "$PROJECT_DIR" -type f -iname '*debug*.apk' -print -quit || true)"
+          if [[ -z "$APK_PATH" ]]; then
+            APK_PATH="$(find "$PROJECT_DIR" -type f -name '*.apk' -print -quit || true)"
+          fi
+          if [[ -z "$APK_PATH" ]]; then
+            echo 'ERROR: assembleDebug completed but no APK was found.'
+            find "$PROJECT_DIR" -maxdepth 6 -type d -name outputs -print
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/artifacts/MoPlayer-debug.apk"
+          ls -lh "$GITHUB_WORKSPACE/artifacts/MoPlayer-debug.apk"
 
       - name: Upload debug APK
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: MoPlayer-debug-apk
-          path: '**/app/build/outputs/apk/debug/*.apk'
+          path: artifacts/MoPlayer-debug.apk
           if-no-files-found: error
+          retention-days: 7
